@@ -63,7 +63,7 @@ stages:
     steps:
     - checkout: self
 
-    # ensure dotnet is there for fallback
+    # ensure dotnet is available for SDK-style projects
     - task: UseDotNet@2
       inputs:
         packageType: 'sdk'
@@ -72,7 +72,7 @@ stages:
     - task: DownloadSecureFile@1
       name: covAuth
       inputs:
-        secureFile: 'auth-key.txt'
+        secureFile: 'auth-key.txt'       # must match Library → Secure files
 
     - powershell: |
         $ErrorActionPreference = 'Stop'
@@ -81,54 +81,38 @@ stages:
         $covBin = "C:\Program Files\Coverity\cov-analysis-win64-2025.6.0\bin"
         if (Test-Path $covBin) { $env:PATH = "$covBin;$env:PATH" } else { throw "Coverity bin not found at $covBin" }
 
-        # Try to put MSBuild on PATH quickly (handles most installs)
-        $msb64 = "C:\BuildTools\MSBuild\Current\Bin\amd64"
-        $msb32 = "C:\BuildTools\MSBuild\Current\Bin"
-        if (Test-Path $msb64) { $env:PATH = "$msb64;$env:PATH" }
-        if (Test-Path $msb32) { $env:PATH = "$msb32;$env:PATH" }
-
         # Find MSBuild.exe via vswhere (most reliable)
         $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-        $msbuild = $null
-        if (Test-Path $vswhere) {
-          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\amd64\MSBuild.exe" | Select-Object -First 1
-          if (-not $msbuild) {
-            $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
-          }
+        if (-not (Test-Path $vswhere)) { throw "vswhere not found at $vswhere" }
+        $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\amd64\MSBuild.exe" | Select-Object -First 1
+        if (-not $msbuild) {
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
         }
+        if (-not $msbuild) { throw "MSBuild.exe not found by vswhere" }
+        Write-Host "Using MSBuild: $msbuild"
+        & "$msbuild" -version
 
-        # Show what we've got
-        Write-Host "PATH (truncated): " + ($env:PATH.Split(';') | Select-Object -First 8 | ForEach-Object { $_ }) -join ';'
-        if ($msbuild) {
-          & "$msbuild" -version
-        } else {
-          Write-Warning "vswhere did not find MSBuild.exe; will try 'msbuild' from PATH or fall back to 'dotnet msbuild'."
-        }
-
-        # Pick solution
+        # Pick the first solution
         $sln = Get-ChildItem -Path "$(Build.SourcesDirectory)" -Filter *.sln -Recurse | Select-Object -First 1
         if (-not $sln) { throw "No .sln found under $(Build.SourcesDirectory)" }
-        Write-Host "Using solution: $($sln.FullName)"
+        Write-Host "Solution: $($sln.FullName)"
 
-        # --- Capture build with Coverity ---
-        if ($msbuild -and (Test-Path $msbuild)) {
-          Write-Host "Using MSBuild at: $msbuild"
-          cov-build --dir cov-int "`"$msbuild`"" "`"$($sln.FullName)`"" /t:Rebuild /p:Configuration=$(buildConfiguration)
-        } else {
-          # try PATH msbuild first
-          $msbCmd = Get-Command msbuild -ErrorAction SilentlyContinue
-          if ($msbCmd) {
-            Write-Host "Using msbuild from PATH: $($msbCmd.Source)"
-            cov-build --dir cov-int msbuild "`"$($sln.FullName)`"" /t:Rebuild /p:Configuration=$(buildConfiguration)
-          } else {
-            # final fallback: dotnet msbuild
-            Write-Warning "Falling back to 'dotnet msbuild'."
-            & dotnet --info
-            cov-build --dir cov-int dotnet msbuild "`"$($sln.FullName)`"" /t:Rebuild /p:Configuration=$(buildConfiguration)
-          }
+        # Restore packages in this stage (fresh workspace)
+        dotnet restore "`"$($sln.FullName)`""
+
+        # Build under cov-build with /restore and a binlog
+        if (Test-Path cov-int) { Remove-Item cov-int -Recurse -Force }
+        $binlog = Join-Path "$(Build.SourcesDirectory)" "msbuild.binlog"
+        $msArgs = "/restore /t:Rebuild /p:Configuration=$(buildConfiguration) /bl:`"$binlog`""
+
+        Write-Host "Running cov-build with: `"$msbuild`" `"$($sln.FullName)`" $msArgs"
+        cov-build --dir cov-int "`"$msbuild`"" "`"$($sln.FullName)`"" $msArgs
+
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "MSBuild failed under cov-build. See the published msbuild.binlog for root cause."
         }
 
-        # Analyze & publish
+        # Analyze & commit to Coverity
         cov-analyze --dir cov-int --all
         cov-format-errors --dir cov-int --html-output cov-html
         cov-commit-defects --dir cov-int `
@@ -139,12 +123,19 @@ stages:
           --on-new-cert trust
       displayName: Capture, Analyze & Commit
 
+    # always publish the binlog so you can inspect failures
+    - task: PublishBuildArtifacts@1
+      displayName: Publish MSBuild binlog
+      condition: always()
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)/msbuild.binlog'
+        ArtifactName: 'msbuild-logs'
+
     - task: PublishBuildArtifacts@1
       displayName: Publish Coverity HTML
       inputs:
         PathtoPublish: 'cov-html'
         ArtifactName: 'coverity-report'
-
 
 # 3) Black Duck SCA on Linux
 - stage: BlackDuck
