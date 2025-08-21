@@ -1,5 +1,15 @@
 trigger:
-  branches: { include: [ main, master ] }
+  branches:
+    include:
+      - main
+      - master
+
+# optional PR validation
+pr:
+  branches:
+    include:
+      - main
+      - master
 
 variables:
 - group: blackduck-secrets
@@ -15,14 +25,19 @@ stages:
   jobs:
   - job: build_dotnet
     displayName: Build .NET
-    pool: { name: coverity-win }
+    pool:
+      name: coverity-win
     steps:
     - checkout: self
     - task: UseDotNet@2
-      inputs: { packageType: 'sdk', version: '8.x' }  
+      inputs:
+        packageType: 'sdk'
+        version: '8.x'
     - task: DotNetCoreCLI@2
       displayName: Restore
-      inputs: { command: 'restore', projects: '**/*.sln' }
+      inputs:
+        command: 'restore'
+        projects: '**/*.sln'
     - task: DotNetCoreCLI@2
       displayName: Build
       inputs:
@@ -40,35 +55,30 @@ stages:
 - stage: Coverity
   displayName: Coverity SAST
   dependsOn: Build
-  variables:
-  - group: synopsys-secrets     # COVERITY_URL, COVERITY_STREAM
   jobs:
   - job: coverity_sast
-    pool: { name: coverity-win }
+    displayName: Coverity SAST
+    pool:
+      name: coverity-win
     steps:
     - checkout: self
     - task: DownloadSecureFile@1
       name: covAuth
       inputs:
-        secureFile: 'auth-key.txt'       # Library → Secure files
+        secureFile: 'auth-key.txt'   # must match the name in Library → Secure files
     - powershell: |
-        # Add Coverity to PATH (update if your version/path differs)
+        $ErrorActionPreference = 'Stop'
         $env:PATH += ";C:\Program Files\Coverity\cov-analysis-win64-2025.6.0\bin"
 
         if (Test-Path cov-int) { Remove-Item cov-int -Recurse -Force }
 
-        # Locate the first .sln in the repo
         $sln = Get-ChildItem -Path "$(Build.SourcesDirectory)" -Filter *.sln -Recurse | Select-Object -First 1
         if (-not $sln) { throw "No .sln found under $(Build.SourcesDirectory)" }
 
-        # Capture build under cov-build (MSBuild)
         cov-build --dir cov-int msbuild $sln.FullName /t:Rebuild /p:Configuration=$(buildConfiguration)
-
-        # Analyze + HTML report
         cov-analyze --dir cov-int --all
         cov-format-errors --dir cov-int --html-output cov-html
 
-        # Commit defects to Coverity Connect
         cov-commit-defects --dir cov-int `
           --url "$(COVERITY_URL)" `
           --stream "$(COVERITY_STREAM)" `
@@ -78,17 +88,19 @@ stages:
       displayName: Capture, Analyze & Commit
     - task: PublishBuildArtifacts@1
       displayName: Publish Coverity HTML
-      inputs: { PathtoPublish: 'cov-html', ArtifactName: 'coverity-report' }
+      inputs:
+        PathtoPublish: 'cov-html'
+        ArtifactName: 'coverity-report'
 
 # 3) Black Duck SCA on Linux
 - stage: BlackDuck
   displayName: Black Duck SCA
   dependsOn: Coverity
-  variables:
-  - group: synopsys-secrets     # BD_URL, BD_API_TOKEN
   jobs:
   - job: bd_scan
-    pool: { name: blackduck-linux }
+    displayName: Detect Scan
+    pool:
+      name: blackduck-linux
     steps:
     - checkout: self
     - bash: |
