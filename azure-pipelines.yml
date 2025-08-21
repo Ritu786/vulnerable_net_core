@@ -1,44 +1,104 @@
-variables:
-- group: shiftleft-token
-
 trigger:
-- master
-- feature/*
+  branches: { include: [ main, master ] }
 
-pool:
-  vmImage: 'windows-latest'
+variables:
+  buildConfiguration: 'Release'
+  projectName: 'VulnerableNetCoreDemo'
 
 stages:
-- stage: Builders
-  displayName: ShiftLeft CORE
+# 1) Build & Test on Windows (coverity-win)
+- stage: Build
+  displayName: Build & Test (.NET)
   jobs:
-  - job: Build
-    displayName: Scan .Net and .Net core apps
-    pool:
-      vmImage: 'windows-latest'
+  - job: build_dotnet
+    displayName: Build .NET
+    pool: { name: coverity-win }
     steps:
-    - task: NuGetToolInstaller@1
-
-    - task: PowerShell@2
-      displayName: Download ShiftLeft cli
-      inputs:
-        targetType: 'inline'
-        script: |
-          Invoke-WebRequest -Uri 'https://cdn.shiftleft.io/download/sl-latest-windows-x64.zip' -OutFile $(Agent.HomeDirectory)\sl.zip
-          Expand-Archive -Path $(Agent.HomeDirectory)\sl.zip -DestinationPath $(Agent.HomeDirectory)\
-
+    - checkout: self
+    - task: UseDotNet@2
+      inputs: { packageType: 'sdk', version: '8.x' }   # adjust to your SDK
     - task: DotNetCoreCLI@2
-      displayName: Restore web api
+      displayName: Restore
+      inputs: { command: 'restore', projects: '**/*.sln' }
+    - task: DotNetCoreCLI@2
+      displayName: Build
       inputs:
-        command: 'restore'
-        projects: '$(Build.SourcesDirectory)'
+        command: 'build'
+        projects: '**/*.sln'
+        arguments: '--configuration $(buildConfiguration)'
+    - task: DotNetCoreCLI@2
+      displayName: Test
+      inputs:
+        command: 'test'
+        projects: '**/*Tests/*.csproj'
+        arguments: '--configuration $(buildConfiguration) --no-build'
 
-    - task: CmdLine@2
-      displayName: Analyze with ShiftLeft CORE
+# 2) Coverity SAST on Windows
+- stage: Coverity
+  displayName: Coverity SAST
+  dependsOn: Build
+  variables:
+  - group: synopsys-secrets     # COVERITY_URL, COVERITY_STREAM
+  jobs:
+  - job: coverity_sast
+    pool: { name: coverity-win }
+    steps:
+    - checkout: self
+    - task: DownloadSecureFile@1
+      name: covAuth
       inputs:
-        script: |
-          $(Agent.HomeDirectory)\sl.exe analyze --wait --app vulnerable_net_core --tag branch=$(Build.SourceBranchName) --csharp --dotnet-framework --cpg vulnerable_asp_net_core.sln
-          $(Agent.HomeDirectory)\sl.exe check-analysis --v2 --app vulnerable_net_core --report
-        workingDirectory: '$(Build.SourcesDirectory)'
-      env:
-        SHIFTLEFT_ACCESS_TOKEN: $(SHIFTLEFT_ACCESS_TOKEN)
+        secureFile: 'auth-key.txt'       # Library → Secure files
+    - powershell: |
+        # Add Coverity to PATH (update if your version/path differs)
+        $env:PATH += ";C:\Program Files\Coverity\cov-analysis-win64-2025.6.0\bin"
+
+        if (Test-Path cov-int) { Remove-Item cov-int -Recurse -Force }
+
+        # Locate the first .sln in the repo
+        $sln = Get-ChildItem -Path "$(Build.SourcesDirectory)" -Filter *.sln -Recurse | Select-Object -First 1
+        if (-not $sln) { throw "No .sln found under $(Build.SourcesDirectory)" }
+
+        # Capture build under cov-build (MSBuild)
+        cov-build --dir cov-int msbuild $sln.FullName /t:Rebuild /p:Configuration=$(buildConfiguration)
+
+        # Analyze + HTML report
+        cov-analyze --dir cov-int --all
+        cov-format-errors --dir cov-int --html-output cov-html
+
+        # Commit defects to Coverity Connect
+        cov-commit-defects --dir cov-int `
+          --url "$(COVERITY_URL)" `
+          --stream "$(COVERITY_STREAM)" `
+          --auth-key-file "$(covAuth.secureFilePath)" `
+          --description "ADO $(Build.BuildNumber) $(Build.SourceVersion)" `
+          --on-new-cert trust
+      displayName: Capture, Analyze & Commit
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Coverity HTML
+      inputs: { PathtoPublish: 'cov-html', ArtifactName: 'coverity-report' }
+
+# 3) Black Duck SCA on Linux
+- stage: BlackDuck
+  displayName: Black Duck SCA
+  dependsOn: Coverity
+  variables:
+  - group: synopsys-secrets     # BD_URL, BD_API_TOKEN
+  jobs:
+  - job: bd_scan
+    pool: { name: blackduck-linux }
+    steps:
+    - checkout: self
+    - bash: |
+        set -e
+        curl -s -L https://detect.synopsys.com/detect9.sh -o detect.sh
+        chmod +x detect.sh
+        ./detect.sh \
+          --blackduck.url="$(BD_URL)" \
+          --blackduck.api.token="$(BD_API_TOKEN)" \
+          --blackduck.trust.cert=true \
+          --detect.project.name="@HooliCorp/vulnerable_net_core" \
+          --detect.project.version.name="$(Build.SourceVersion)" \
+          --detect.policy.check=true \
+          --detect.cleanup=true \
+          --detect.timeout=1200
+      displayName: Black Duck Detect (SCA)
