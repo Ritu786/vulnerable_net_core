@@ -108,26 +108,12 @@ stages:
         # 1) Restore first (fresh workspace)
         dotnet restore "`"$($sln.FullName)`""
 
-        # 2) Build under Coverity with MSBuild (binlog to artifact staging)
+        # 2) Build under Coverity with dotnet msbuild (binlog to artifact staging)
         if (Test-Path cov-int) { Remove-Item cov-int -Recurse -Force }
 
-        # Correctly prepare MSBuild args as an array
-        $msbuildArgs = @(
-            "/t:Rebuild"
-            "/p:Configuration=$(buildConfiguration)"
-            "/bl:$binlog"
-        )
-
-        Write-Host "cov-build (MSBuild): `"$msbuild`" `"$($sln.FullName)`" $($msbuildArgs -join ' ')"
-        cov-build --dir cov-int "$msbuild" "$($sln.FullName)" $msbuildArgs
+        Write-Host "cov-build (dotnet msbuild): dotnet msbuild `"$($sln.FullName)`" /t:Rebuild /p:Configuration=$(buildConfiguration) /bl:`"$binlog`""
+        cov-build --dir cov-int dotnet msbuild "$($sln.FullName)" /t:Rebuild /p:Configuration=$(buildConfiguration) /bl:"$binlog"
         $exit = $LASTEXITCODE
-
-        if ($exit -ne 0) {
-          Write-Warning "MSBuild under cov-build returned $exit. Trying fallback: 'dotnet msbuild'."
-          # Fallback attempt with dotnet msbuild (sometimes resolves SDK resolver quirks)
-          cov-build --dir cov-int dotnet msbuild "$($sln.FullName)" /t:Rebuild /p:Configuration=$(buildConfiguration) /bl:"$binlog"
-          $exit = $LASTEXITCODE
-        }
 
         if ($exit -ne 0) {
           if (Test-Path $binlog) {
