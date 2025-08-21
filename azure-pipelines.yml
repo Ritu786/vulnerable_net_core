@@ -110,7 +110,7 @@ stages:
 
         # 2) Build under Coverity with MSBuild (binlog to artifact staging)
         if (Test-Path cov-int) { Remove-Item cov-int -Recurse -Force }
-        $msArgs = "/restore /t:Rebuild /p:Configuration=$(buildConfiguration) /bl:`"$binlog`""
+        $msArgs = "/t:Rebuild /p:Configuration=$(buildConfiguration) /bl:`"$binlog`""
         Write-Host "cov-build (MSBuild): `"$msbuild`" `"$($sln.FullName)`" $msArgs"
         cov-build --dir cov-int "`"$msbuild`"" "`"$($sln.FullName)`"" $msArgs
         $exit = $LASTEXITCODE
