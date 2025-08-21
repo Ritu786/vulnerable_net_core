@@ -2,8 +2,11 @@ trigger:
   branches: { include: [ main, master ] }
 
 variables:
-  buildConfiguration: 'Release'
-  projectName: 'VulnerableNetCoreDemo'
+- group: blackduck-secrets
+- name: buildConfiguration
+  value: 'Release'
+- name: projectName
+  value: 'VulnerableNetCoreDemo'
 
 stages:
 # 1) Build & Test on Windows (coverity-win)
@@ -16,7 +19,7 @@ stages:
     steps:
     - checkout: self
     - task: UseDotNet@2
-      inputs: { packageType: 'sdk', version: '8.x' }   # adjust to your SDK
+      inputs: { packageType: 'sdk', version: '8.x' }  
     - task: DotNetCoreCLI@2
       displayName: Restore
       inputs: { command: 'restore', projects: '**/*.sln' }
