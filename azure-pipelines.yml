@@ -4,7 +4,6 @@ trigger:
       - main
       - master
 
-# optional PR validation
 pr:
   branches:
     include:
@@ -19,7 +18,6 @@ variables:
   value: 'VulnerableNetCoreDemo'
 
 stages:
-# 1) Build & Test on Windows (coverity-win)
 - stage: Build
   displayName: Build & Test (.NET)
   jobs:
@@ -51,7 +49,6 @@ stages:
         projects: '**/*Tests/*.csproj'
         arguments: '--configuration $(buildConfiguration) --no-build'
 
-# 2) Coverity SAST on Windows
 - stage: Coverity
   displayName: Coverity SAST
   dependsOn: Build
@@ -62,18 +59,14 @@ stages:
       name: coverity-win
     steps:
     - checkout: self
-
-    # make sure dotnet SDK is on PATH for this job
     - task: UseDotNet@2
       inputs:
         packageType: 'sdk'
         version: '8.x'
-
     - task: DownloadSecureFile@1
       name: covAuth
       inputs:
         secureFile: 'auth-key.txt'
-
     - powershell: |
         $ErrorActionPreference = 'Stop'
 
@@ -124,7 +117,6 @@ stages:
 
         if ($exit -ne 0) {
           Write-Warning "MSBuild under cov-build returned $exit. Trying fallback: 'dotnet msbuild'."
-          # Fallback attempt with dotnet msbuild (sometimes resolves SDK resolver quirks)
           cov-build --dir cov-int dotnet msbuild "`"$($sln.FullName)`"" /t:Rebuild /p:Configuration=$(buildConfiguration) /bl:"$binlog"
           $exit = $LASTEXITCODE
         }
@@ -148,10 +140,19 @@ stages:
           --on-new-cert trust
       displayName: Capture, Analyze & Commit
 
-    # Always publish the MSBuild binlog so we can see the root cause
+    # Pre-step: set variable if binlog exists
+    - powershell: |
+        if (Test-Path "$(Build.ArtifactStagingDirectory)/msbuild.binlog") {
+          Write-Host "##vso[task.setvariable variable=publishBinlog]true"
+        } else {
+          Write-Host "##vso[task.setvariable variable=publishBinlog]false"
+        }
+      displayName: Check for binlog
+
+    # Only publish artifact if binlog exists
     - task: PublishBuildArtifacts@1
       displayName: Publish MSBuild binlog
-      condition: always()
+      condition: eq(variables['publishBinlog'], 'true')
       inputs:
         PathtoPublish: '$(Build.ArtifactStagingDirectory)/msbuild.binlog'
         ArtifactName: 'msbuild-logs'
@@ -163,7 +164,6 @@ stages:
         PathtoPublish: 'cov-html'
         ArtifactName: 'coverity-report'
 
-# 3) Black Duck SCA on Linux
 - stage: BlackDuck
   displayName: Black Duck SCA
   dependsOn: Coverity
