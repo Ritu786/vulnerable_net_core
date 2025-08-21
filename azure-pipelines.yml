@@ -62,23 +62,75 @@ stages:
       name: coverity-win
     steps:
     - checkout: self
+
+    # ensure dotnet is there for fallback
+    - task: UseDotNet@2
+      inputs:
+        packageType: 'sdk'
+        version: '8.x'
+
     - task: DownloadSecureFile@1
       name: covAuth
       inputs:
-        secureFile: 'auth-key.txt'   # must match the name in Library → Secure files
+        secureFile: 'auth-key.txt'
+
     - powershell: |
         $ErrorActionPreference = 'Stop'
-        $env:PATH += ";C:\Program Files\Coverity\cov-analysis-win64-2025.6.0\bin"
 
-        if (Test-Path cov-int) { Remove-Item cov-int -Recurse -Force }
+        # Add Coverity bin to PATH
+        $covBin = "C:\Program Files\Coverity\cov-analysis-win64-2025.6.0\bin"
+        if (Test-Path $covBin) { $env:PATH = "$covBin;$env:PATH" } else { throw "Coverity bin not found at $covBin" }
 
+        # Try to put MSBuild on PATH quickly (handles most installs)
+        $msb64 = "C:\BuildTools\MSBuild\Current\Bin\amd64"
+        $msb32 = "C:\BuildTools\MSBuild\Current\Bin"
+        if (Test-Path $msb64) { $env:PATH = "$msb64;$env:PATH" }
+        if (Test-Path $msb32) { $env:PATH = "$msb32;$env:PATH" }
+
+        # Find MSBuild.exe via vswhere (most reliable)
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $msbuild = $null
+        if (Test-Path $vswhere) {
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\amd64\MSBuild.exe" | Select-Object -First 1
+          if (-not $msbuild) {
+            $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+          }
+        }
+
+        # Show what we've got
+        Write-Host "PATH (truncated): " + ($env:PATH.Split(';') | Select-Object -First 8 | ForEach-Object { $_ }) -join ';'
+        if ($msbuild) {
+          & "$msbuild" -version
+        } else {
+          Write-Warning "vswhere did not find MSBuild.exe; will try 'msbuild' from PATH or fall back to 'dotnet msbuild'."
+        }
+
+        # Pick solution
         $sln = Get-ChildItem -Path "$(Build.SourcesDirectory)" -Filter *.sln -Recurse | Select-Object -First 1
         if (-not $sln) { throw "No .sln found under $(Build.SourcesDirectory)" }
+        Write-Host "Using solution: $($sln.FullName)"
 
-        cov-build --dir cov-int msbuild $sln.FullName /t:Rebuild /p:Configuration=$(buildConfiguration)
+        # --- Capture build with Coverity ---
+        if ($msbuild -and (Test-Path $msbuild)) {
+          Write-Host "Using MSBuild at: $msbuild"
+          cov-build --dir cov-int "`"$msbuild`"" "`"$($sln.FullName)`"" /t:Rebuild /p:Configuration=$(buildConfiguration)
+        } else {
+          # try PATH msbuild first
+          $msbCmd = Get-Command msbuild -ErrorAction SilentlyContinue
+          if ($msbCmd) {
+            Write-Host "Using msbuild from PATH: $($msbCmd.Source)"
+            cov-build --dir cov-int msbuild "`"$($sln.FullName)`"" /t:Rebuild /p:Configuration=$(buildConfiguration)
+          } else {
+            # final fallback: dotnet msbuild
+            Write-Warning "Falling back to 'dotnet msbuild'."
+            & dotnet --info
+            cov-build --dir cov-int dotnet msbuild "`"$($sln.FullName)`"" /t:Rebuild /p:Configuration=$(buildConfiguration)
+          }
+        }
+
+        # Analyze & publish
         cov-analyze --dir cov-int --all
         cov-format-errors --dir cov-int --html-output cov-html
-
         cov-commit-defects --dir cov-int `
           --url "$(COVERITY_URL)" `
           --stream "$(COVERITY_STREAM)" `
@@ -86,11 +138,13 @@ stages:
           --description "ADO $(Build.BuildNumber) $(Build.SourceVersion)" `
           --on-new-cert trust
       displayName: Capture, Analyze & Commit
+
     - task: PublishBuildArtifacts@1
       displayName: Publish Coverity HTML
       inputs:
         PathtoPublish: 'cov-html'
         ArtifactName: 'coverity-report'
+
 
 # 3) Black Duck SCA on Linux
 - stage: BlackDuck
