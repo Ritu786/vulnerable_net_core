@@ -79,27 +79,6 @@ stages:
         New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)" | Out-Null
         $binlog = Join-Path "$(Build.ArtifactStagingDirectory)" "msbuild.binlog"
 
-        # Help MSBuild find the .NET SDK that UseDotNet installed
-        $dotnetPath = (Get-Command dotnet).Source
-        $dotnetDir  = Split-Path $dotnetPath -Parent
-        $env:DOTNET_ROOT = $dotnetDir
-        $env:DOTNET_MSBUILD_SDK_RESOLVER_CLI_DIR = $dotnetDir
-        $env:DOTNET_MULTILEVEL_LOOKUP = "0"
-
-        Write-Host "dotnet: $dotnetPath"
-        & dotnet --info
-        & dotnet --list-sdks
-
-        # Locate MSBuild.exe via vswhere (absolute path)
-        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-        if (!(Test-Path $vswhere)) { throw "vswhere not found at $vswhere" }
-        $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\amd64\MSBuild.exe" | Select-Object -First 1
-        if (-not $msbuild) {
-          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
-        }
-        if (-not $msbuild) { throw "MSBuild.exe not found by vswhere" }
-        & "$msbuild" -version
-
         # Find solution
         $sln = Get-ChildItem -Path "$(Build.SourcesDirectory)" -Filter *.sln -Recurse | Select-Object -First 1
         if (-not $sln) { throw "No .sln found under $(Build.SourcesDirectory)" }
@@ -108,30 +87,28 @@ stages:
         # 1) Restore first (fresh workspace)
         dotnet restore "`"$($sln.FullName)`""
 
-        # 2) Build under Coverity with dotnet msbuild (binlog to artifact staging)
+        # 2) Run cov-dotnet capture
         if (Test-Path cov-int) { Remove-Item cov-int -Recurse -Force }
-
-        Write-Host "cov-build (dotnet msbuild): dotnet msbuild `"$($sln.FullName)`" /t:Rebuild /p:Configuration=$(buildConfiguration) /bl:`"$binlog`""
-        cov-build --dir cov-int dotnet msbuild "$($sln.FullName)" /t:Rebuild /p:Configuration=$(buildConfiguration) /bl:"$binlog"
+        & "$covBin\cov-dotnet.exe" capture --dir cov-int --solution "$($sln.FullName)" --configuration Release --no-default-configuration --msbuild-verbosity diag --msbuild-log "$binlog"
         $exit = $LASTEXITCODE
 
         if ($exit -ne 0) {
           if (Test-Path $binlog) {
-            Write-Error "Build failed (exit $exit). Binlog at $binlog will be published."
+            Write-Error "cov-dotnet capture failed (exit $exit). Binlog at $binlog will be published."
           } else {
-            Write-Error "Build failed (exit $exit) and binlog missing; check preceding error output."
+            Write-Error "cov-dotnet capture failed (exit $exit) and binlog missing; check preceding error output."
           }
         }
 
         # 3) Analyze & Commit (only if build produced TUs)
-        cov-analyze --dir cov-int --all
-        cov-format-errors --dir cov-int --html-output cov-html
-        cov-commit-defects --dir cov-int `
-          --url "$(COVERITY_URL)" `
-          --stream "$(COVERITY_STREAM)" `
-          --auth-key-file "$(covAuth.secureFilePath)" `
-          --description "ADO $(Build.BuildNumber) $(Build.SourceVersion)" `
-          --on-new-cert trust
+        & "$covBin\cov-analyze.exe" --dir cov-int --all
+        & "$covBin\cov-format-errors.exe" --dir cov-int --html-output cov-html
+        & "$covBin\cov-commit-defects.exe" --dir cov-int `
+            --url "$(COVERITY_URL)" `
+            --stream "$(COVERITY_STREAM)" `
+            --auth-key-file "$(covAuth.secureFilePath)" `
+            --description "ADO $(Build.BuildNumber) $(Build.SourceVersion)" `
+            --on-new-cert trust
       displayName: Capture, Analyze & Commit
 
     # Pre-step: set variable if binlog exists
