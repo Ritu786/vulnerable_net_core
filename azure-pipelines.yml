@@ -70,8 +70,8 @@ stages:
     - powershell: |
         $ErrorActionPreference = 'Stop'
 
-        # Paths & env
-        $covBin = "C:\Program Files\Coverity\cov-analysis-win64-2025.6.0\bin"
+        # Updated Coverity bin path
+        $covBin = "C:\Program Files\Coverity\Coverity Static Analysis\bin"
         if (!(Test-Path $covBin)) { throw "Coverity bin not found at $covBin" }
         $env:PATH = "$covBin;$env:PATH"
 
