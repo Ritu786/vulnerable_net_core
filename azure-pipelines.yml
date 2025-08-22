@@ -67,27 +67,22 @@ stages:
     - powershell: |
         $ErrorActionPreference = 'Stop'
 
-        # --- Resolve Coverity bin ---
-        $covBin = $env:COVERITY_BIN
-        if ([string]::IsNullOrWhiteSpace($covBin) -or -not (Test-Path $covBin)) {
-          $roots = @('C:\Program Files\Coverity', 'C:\Program Files (x86)\Coverity')
-          $covBuild = $null
-          foreach ($r in $roots) {
-            if (Test-Path $r) {
-              $covBuild = Get-ChildItem -Path $r -Recurse -Filter 'cov-build*.exe' -ErrorAction SilentlyContinue |
-                          Select-Object -First 1 -ExpandProperty FullName
-              if ($covBuild) { break }
-            }
-          }
-          if (-not $covBuild) {
-            throw "Could not find cov-build.exe under $($roots -join ', '). Set pipeline variable COVERITY_BIN to your bin folder."
-          }
-          $covBin = Split-Path $covBuild -Parent
-        }
-        if (-not (Test-Path $covBin)) { throw "Coverity bin not found at $covBin" }
+        # --- Locate Coverity bin by the actual executable ---
+        $covRoot  = 'C:\Program Files\Coverity'
+        $covBuild = Get-ChildItem -Path $covRoot -Recurse -Filter 'cov-build.exe' -ErrorAction SilentlyContinue |
+                    Select-Object -First 1 -ExpandProperty FullName
+        if (-not $covBuild) { throw "cov-build.exe not found under $covRoot" }
+        $covBin = Split-Path $covBuild -Parent
         $env:PATH = "$covBin;$env:PATH"
         Write-Host "Using Coverity bin: $covBin"
-        Get-ChildItem $covBin -Filter 'cov-*.exe' | Select Name | Out-Host
+
+        # --- Create a minimal Coverity config (satisfies cov-build check) ---
+        $covConfig = Join-Path "$(Agent.TempDirectory)" "cov-config"
+        New-Item -ItemType Directory -Force -Path $covConfig | Out-Null
+        & "$covBin\cov-configure.exe" --config "$covConfig" --template
+        if ($LASTEXITCODE -ne 0) { throw "cov-configure failed (exit $LASTEXITCODE)" }
+        $env:COV_CONFIG = $covConfig
+        Write-Host "COV_CONFIG set to $covConfig"
 
         # --- Logs dir & binlog path ---
         New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)\logs" | Out-Null
@@ -95,15 +90,12 @@ stages:
         $binlog  = Join-Path $logsDir "msbuild.binlog"
         $txtlog  = Join-Path $logsDir "msbuild.txt"
 
-        # --- Locate solution ---
+        # --- Pick solution & restore ---
         $sln = Get-ChildItem -Path "$(Build.SourcesDirectory)" -Filter *.sln -Recurse | Select-Object -First 1
         if (-not $sln) { throw "No .sln found under $(Build.SourcesDirectory)" }
-        Write-Host "Solution: $($sln.FullName)"
-
-        # 1) Restore
         dotnet restore "`"$($sln.FullName)`""
 
-        # 2) Capture with dotnet msbuild
+        # --- Capture build under Coverity using dotnet msbuild ---
         if (Test-Path cov-int) { Remove-Item cov-int -Recurse -Force }
         cov-build --dir cov-int dotnet msbuild "`"$($sln.FullName)`"" /m `
           /t:Rebuild /p:Configuration=$(buildConfiguration) `
@@ -111,7 +103,7 @@ stages:
           /bl:"$binlog" /flp:LogFile="$txtlog";verbosity=normal
         if ($LASTEXITCODE -ne 0) { throw "Build failed. See $binlog / $txtlog." }
 
-        # 3) Analyze & Commit
+        # --- Analyze & commit ---
         cov-analyze --dir cov-int --all
         cov-format-errors --dir cov-int --html-output cov-html
         cov-commit-defects --dir cov-int `
