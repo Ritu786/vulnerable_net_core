@@ -1,14 +1,10 @@
 trigger:
   branches:
-    include:
-      - main
-      - master
+    include: [ main, master ]
 
 pr:
   branches:
-    include:
-      - main
-      - master
+    include: [ main, master ]
 
 variables:
 - group: blackduck-secrets
@@ -18,24 +14,22 @@ variables:
   value: 'VulnerableNetCoreDemo'
 
 stages:
+# 1) Build & Test on Windows (coverity-win)
 - stage: Build
   displayName: Build & Test (.NET)
   jobs:
   - job: build_dotnet
-    displayName: Build .NET
-    pool:
-      name: coverity-win
+    pool: { name: coverity-win }
     steps:
     - checkout: self
+    # ✅ need 3.1 SDK for netcoreapp3.1
     - task: UseDotNet@2
-      inputs:
-        packageType: 'sdk'
-        version: '8.x'
+      inputs: { packageType: 'sdk', version: '3.1.426' }
+    - task: UseDotNet@2
+      inputs: { packageType: 'sdk', version: '8.x' }
     - task: DotNetCoreCLI@2
       displayName: Restore
-      inputs:
-        command: 'restore'
-        projects: '**/*.sln'
+      inputs: { command: 'restore', projects: '**/*.sln' }
     - task: DotNetCoreCLI@2
       displayName: Build
       inputs:
@@ -49,84 +43,81 @@ stages:
         projects: '**/*Tests/*.csproj'
         arguments: '--configuration $(buildConfiguration) --no-build'
 
+# 2) Coverity SAST on Windows (MSBuild capture)
 - stage: Coverity
   displayName: Coverity SAST
   dependsOn: Build
   jobs:
   - job: coverity_sast
-    displayName: Coverity SAST
-    pool:
-      name: coverity-win
+    pool: { name: coverity-win }
     steps:
     - checkout: self
+    # ✅ install both SDKs here too (fresh job/fresh tools folder)
     - task: UseDotNet@2
-      inputs:
-        packageType: 'sdk'
-        version: '8.x'
+      inputs: { packageType: 'sdk', version: '3.1.426' }
+    - task: UseDotNet@2
+      inputs: { packageType: 'sdk', version: '8.x' }
+
     - task: DownloadSecureFile@1
       name: covAuth
-      inputs:
-        secureFile: 'auth-key.txt'
+      inputs: { secureFile: 'auth-key.txt' }
+
     - powershell: |
         $ErrorActionPreference = 'Stop'
 
-        # Updated Coverity bin path
-        $covBin = "C:\Program Files\Coverity\Coverity Static Analysis\bin"
-        if (!(Test-Path $covBin)) { throw "Coverity bin not found at $covBin" }
+        # --- Find Coverity bin (accept both layouts) ---
+        $covBins = @(
+          'C:\Program Files\Coverity\Coverity Static Analysis\bin',
+          (Get-ChildItem 'C:\Program Files\Coverity\' -Directory -Filter 'cov-analysis-win64-*' -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName 'bin' })
+        ) | Where-Object { $_ -and (Test-Path $_) }
+
+        if (-not $covBins -or -not (Test-Path $covBins[0])) { throw "Coverity bin not found." }
+        $covBin = $covBins[0]
         $env:PATH = "$covBin;$env:PATH"
+        Write-Host "Using Coverity bin: $covBin"
 
-        # Ensure artifact staging exists and pick binlog path there
-        New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)" | Out-Null
-        $binlog = Join-Path "$(Build.ArtifactStagingDirectory)" "msbuild.binlog"
+        # --- Logs folder + binlog path ---
+        New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)\logs" | Out-Null
+        $logsDir = "$(Build.ArtifactStagingDirectory)\logs"
+        $binlog  = Join-Path $logsDir "msbuild.binlog"
+        $txtlog  = Join-Path $logsDir "msbuild.txt"
 
-        # Find solution
+        # --- Choose solution ---
         $sln = Get-ChildItem -Path "$(Build.SourcesDirectory)" -Filter *.sln -Recurse | Select-Object -First 1
         if (-not $sln) { throw "No .sln found under $(Build.SourcesDirectory)" }
         Write-Host "Solution: $($sln.FullName)"
 
-        # 1) Restore first (fresh workspace)
+        # 1) Restore (fresh job)
         dotnet restore "`"$($sln.FullName)`""
 
-        # 2) Run cov-dotnet capture
+        # 2) Capture build under Coverity using dotnet msbuild
         if (Test-Path cov-int) { Remove-Item cov-int -Recurse -Force }
-        & "$covBin\cov-dotnet.exe" capture --dir cov-int --solution "$($sln.FullName)" --configuration Release --no-default-configuration --msbuild-verbosity diag --msbuild-log "$binlog"
-        $exit = $LASTEXITCODE
+        Write-Host "cov-build capture with 'dotnet msbuild'..."
+        cov-build --dir cov-int dotnet msbuild "`"$($sln.FullName)`"" /m `
+          /t:Rebuild /p:Configuration=$(buildConfiguration) `
+          /p:GenerateFullPaths=true /nr:false `
+          /bl:"$binlog" /flp:LogFile="$txtlog";verbosity=normal
+        if ($LASTEXITCODE -ne 0) { throw "Build failed. See $binlog / $txtlog." }
 
-        if ($exit -ne 0) {
-          if (Test-Path $binlog) {
-            Write-Error "cov-dotnet capture failed (exit $exit). Binlog at $binlog will be published."
-          } else {
-            Write-Error "cov-dotnet capture failed (exit $exit) and binlog missing; check preceding error output."
-          }
-        }
-
-        # 3) Analyze & Commit (only if build produced TUs)
-        & "$covBin\cov-analyze.exe" --dir cov-int --all
-        & "$covBin\cov-format-errors.exe" --dir cov-int --html-output cov-html
-        & "$covBin\cov-commit-defects.exe" --dir cov-int `
-            --url "$(COVERITY_URL)" `
-            --stream "$(COVERITY_STREAM)" `
-            --auth-key-file "$(covAuth.secureFilePath)" `
-            --description "ADO $(Build.BuildNumber) $(Build.SourceVersion)" `
-            --on-new-cert trust
+        # 3) Analyze & Commit
+        cov-analyze --dir cov-int --all
+        cov-format-errors --dir cov-int --html-output cov-html
+        cov-commit-defects --dir cov-int `
+          --url "$(COVERITY_URL)" `
+          --stream "$(COVERITY_STREAM)" `
+          --auth-key-file "$(covAuth.secureFilePath)" `
+          --description "ADO $(Build.BuildNumber) $(Build.SourceVersion)" `
+          --on-new-cert trust
       displayName: Capture, Analyze & Commit
 
-    # Pre-step: set variable if binlog exists
-    - powershell: |
-        if (Test-Path "$(Build.ArtifactStagingDirectory)/msbuild.binlog") {
-          Write-Host "##vso[task.setvariable variable=publishBinlog]true"
-        } else {
-          Write-Host "##vso[task.setvariable variable=publishBinlog]false"
-        }
-      displayName: Check for binlog
-
-    # Only publish artifact if binlog exists
+    # Always publish logs so we can diagnose if the build fails
     - task: PublishBuildArtifacts@1
-      displayName: Publish MSBuild binlog
-      condition: eq(variables['publishBinlog'], 'true')
+      displayName: Publish diagnostic logs
+      condition: always()
       inputs:
-        PathtoPublish: '$(Build.ArtifactStagingDirectory)/msbuild.binlog'
-        ArtifactName: 'msbuild-logs'
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/logs'
+        ArtifactName: 'diag-logs'
 
     - task: PublishBuildArtifacts@1
       displayName: Publish Coverity HTML
@@ -135,14 +126,13 @@ stages:
         PathtoPublish: 'cov-html'
         ArtifactName: 'coverity-report'
 
+# 3) Black Duck SCA on Linux
 - stage: BlackDuck
   displayName: Black Duck SCA
   dependsOn: Coverity
   jobs:
   - job: bd_scan
-    displayName: Detect Scan
-    pool:
-      name: blackduck-linux
+    pool: { name: blackduck-linux }
     steps:
     - checkout: self
     - bash: |
