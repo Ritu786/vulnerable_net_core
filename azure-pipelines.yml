@@ -80,7 +80,7 @@ stages:
         cov-build --dir cov-int dotnet msbuild "`"$($sln.FullName)`"" /m `
           /t:Rebuild /p:Configuration=$(buildConfiguration) `
           /p:GenerateFullPaths=true /nr:false `
-          /bl:"$binlog" "/flp:LogFile="$txtlog";verbosity=normal"
+          /bl:"$binlog" "/flp:LogFile=$txtlog;verbosity=normal"
         if ($LASTEXITCODE -ne 0) { throw "Build failed. See $binlog / $txtlog." }
         cov-analyze --dir cov-int --all
         cov-format-errors --dir cov-int --html-output cov-html
