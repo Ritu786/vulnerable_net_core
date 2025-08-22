@@ -8,6 +8,8 @@ pr:
 
 variables:
 - group: blackduck-secrets
+- name: COVERITY_BIN
+  value: 'C:\Program Files\Coverity\Coverity Static Analysis\bin'
 - name: buildConfiguration
   value: 'Release'
 - name: projectName
@@ -65,35 +67,44 @@ stages:
     - powershell: |
         $ErrorActionPreference = 'Stop'
 
-        # --- Find Coverity bin (accept both layouts) ---
-        $covBins = @(
-          'C:\Program Files\Coverity\Coverity Static Analysis\bin',
-          (Get-ChildItem 'C:\Program Files\Coverity\' -Directory -Filter 'cov-analysis-win64-*' -ErrorAction SilentlyContinue |
-            Sort-Object Name -Descending | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName 'bin' })
-        ) | Where-Object { $_ -and (Test-Path $_) }
-
-        if (-not $covBins -or -not (Test-Path $covBins[0])) { throw "Coverity bin not found." }
-        $covBin = $covBins[0]
+        # --- Resolve Coverity bin ---
+        $covBin = $env:COVERITY_BIN
+        if ([string]::IsNullOrWhiteSpace($covBin) -or -not (Test-Path $covBin)) {
+          $roots = @('C:\Program Files\Coverity', 'C:\Program Files (x86)\Coverity')
+          $covBuild = $null
+          foreach ($r in $roots) {
+            if (Test-Path $r) {
+              $covBuild = Get-ChildItem -Path $r -Recurse -Filter 'cov-build*.exe' -ErrorAction SilentlyContinue |
+                          Select-Object -First 1 -ExpandProperty FullName
+              if ($covBuild) { break }
+            }
+          }
+          if (-not $covBuild) {
+            throw "Could not find cov-build.exe under $($roots -join ', '). Set pipeline variable COVERITY_BIN to your bin folder."
+          }
+          $covBin = Split-Path $covBuild -Parent
+        }
+        if (-not (Test-Path $covBin)) { throw "Coverity bin not found at $covBin" }
         $env:PATH = "$covBin;$env:PATH"
         Write-Host "Using Coverity bin: $covBin"
+        Get-ChildItem $covBin -Filter 'cov-*.exe' | Select Name | Out-Host
 
-        # --- Logs folder + binlog path ---
+        # --- Logs dir & binlog path ---
         New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)\logs" | Out-Null
         $logsDir = "$(Build.ArtifactStagingDirectory)\logs"
         $binlog  = Join-Path $logsDir "msbuild.binlog"
         $txtlog  = Join-Path $logsDir "msbuild.txt"
 
-        # --- Choose solution ---
+        # --- Locate solution ---
         $sln = Get-ChildItem -Path "$(Build.SourcesDirectory)" -Filter *.sln -Recurse | Select-Object -First 1
         if (-not $sln) { throw "No .sln found under $(Build.SourcesDirectory)" }
         Write-Host "Solution: $($sln.FullName)"
 
-        # 1) Restore (fresh job)
+        # 1) Restore
         dotnet restore "`"$($sln.FullName)`""
 
-        # 2) Capture build under Coverity using dotnet msbuild
+        # 2) Capture with dotnet msbuild
         if (Test-Path cov-int) { Remove-Item cov-int -Recurse -Force }
-        Write-Host "cov-build capture with 'dotnet msbuild'..."
         cov-build --dir cov-int dotnet msbuild "`"$($sln.FullName)`"" /m `
           /t:Rebuild /p:Configuration=$(buildConfiguration) `
           /p:GenerateFullPaths=true /nr:false `
@@ -110,6 +121,7 @@ stages:
           --description "ADO $(Build.BuildNumber) $(Build.SourceVersion)" `
           --on-new-cert trust
       displayName: Capture, Analyze & Commit
+
 
     # Always publish logs so we can diagnose if the build fails
     - task: PublishBuildArtifacts@1
