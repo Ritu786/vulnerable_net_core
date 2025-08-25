@@ -84,6 +84,11 @@ stages:
         if ($LASTEXITCODE -ne 0) { throw "Build failed. See $binlog / $txtlog." }
         cov-analyze --dir cov-int --all
         cov-format-errors --dir cov-int --html-output cov-html
+
+        # Export files SRM can ingest
+        cov-format-errors --dir cov-int --json-output-v10 coverity.json
+        cov-format-errors --dir cov-int --sarif-output coverity.sarif
+
         cov-commit-defects --dir cov-int `
           --url "$(COVERITY_URL)" `
           --stream "$(COVERITY_STREAM)" `
@@ -102,7 +107,13 @@ stages:
       condition: succeeded()
       inputs:
         PathtoPublish: 'cov-html'
-        ArtifactName: 'coverity-report'
+        ArtifactName: 'coverity-report'      
+    - task: PublishBuildArtifacts@1
+      displayName: Publish SRM inputs (Coverity)
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)'
+        ArtifactName: 'srm-inputs'
+
 
 # 3) Black Duck SCA on Linux
 - stage: BlackDuck
@@ -127,3 +138,57 @@ stages:
           --detect.cleanup=true \
           --detect.timeout=1200
       displayName: Black Duck Detect (SCA)
+  
+# 4) SRM ingest (runtime CLI download)
+- stage: SRM
+  displayName: Software Risk Manager ingest
+  dependsOn:
+    - Coverity
+    - BlackDuck
+  variables:
+  - group: srm-secrets     # SRM_BASE_URL, SRM_API_KEY, SRM_PROJECT_ID
+  jobs:
+  - job: srm_push
+    displayName: Push findings to SRM
+    pool: { name: blackduck-linux }   # your Linux agent (ss-bd-sca01)
+    steps:
+    - checkout: none
+
+    - task: DownloadBuildArtifacts@1
+      displayName: Download SRM inputs
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'srm-inputs'
+        downloadPath: '$(Pipeline.Workspace)'
+
+    - bash: |
+        set -euo pipefail
+        cd "$(Pipeline.Workspace)/srm-inputs"
+
+        # --- Get Code Dx / SRM CLI (Linux x64) ---
+        CLI_VERSION="v0.3.0"
+        CLI_URL="https://github.com/codedx/codedx-cli-client/releases/download/${CLI_VERSION}/codedx-client-linux-amd64"
+        echo "Downloading SRM CLI from: $CLI_URL"
+        curl -fL "$CLI_URL" -o codedx-client
+        chmod +x codedx-client
+        CLI_PATH="./codedx-client"
+
+        # Optional: quick auth check (lists projects; ignore failure)
+        $CLI_PATH "$(SRM_BASE_URL)" --api-key "api-key:$(SRM_API_KEY)" --insecure projects >/dev/null 2>&1 || true
+
+        # Collect files exported by the Coverity stage
+        FILES=""
+        [ -f coverity.sarif ] && FILES="$FILES coverity.sarif"
+        [ -f coverity.json ]  && FILES="$FILES coverity.json"
+
+        if [ -z "$FILES" ]; then
+          echo "No SRM input files found; skipping upload."
+          exit 0
+        fi
+
+        echo "Uploading to SRM project $(SRM_PROJECT_ID): $FILES"
+        $CLI_PATH "$(SRM_BASE_URL)" \
+          --api-key "api-key:$(SRM_API_KEY)" --insecure \
+          analyze "$(SRM_PROJECT_ID)" $FILES
+      displayName: Upload results to SRM
