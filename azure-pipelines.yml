@@ -145,7 +145,7 @@ stages:
     - Coverity
     - BlackDuck
   variables:
-  - group: srm-secrets     # SRM_BASE_URL, SRM_API_KEY, SRM_PROJECT_ID
+  - group: srm-secrets     
   jobs:
   - job: srm_push
     displayName: Push findings to SRM
@@ -178,7 +178,6 @@ stages:
 
         # Collect files exported by the Coverity stage
         FILES=""
-        [ -f coverity.sarif ] && FILES="$FILES coverity.sarif"
         [ -f coverity.json ]  && FILES="$FILES coverity.json"
 
         if [ -z "$FILES" ]; then
