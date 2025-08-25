@@ -173,10 +173,9 @@ stages:
 
         # 2) Compose the SRM API upload URL
         SRM_PROJECT_ID="$(SRM_PROJECT_ID)"
-        SRM_BRANCH_ID="$(SRM_BRANCH_ID)"    # Add to variable group!
         SRM_BASE_URL="$(SRM_BASE_URL)"
         SRM_API_KEY="$(SRM_API_KEY)"
-        SRM_UPLOAD_URL="${SRM_BASE_URL%/}/api/projects/${SRM_PROJECT_ID};branchId=${SRM_BRANCH_ID}/analysis"
+        SRM_UPLOAD_URL="${SRM_BASE_URL%/}/api/projects/${SRM_PROJECT_ID}/analysis"
 
         echo "Uploading coverity.json to SRM at $SRM_UPLOAD_URL"
 
