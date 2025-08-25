@@ -165,52 +165,35 @@ stages:
         set -euo pipefail
         cd "$(Pipeline.Workspace)/srm-inputs"
 
-        # --- 1) Ensure input exists ---
+        # 1) Ensure input exists
         if [ ! -f coverity.json ]; then
           echo "No coverity.json found; nothing to upload."
           exit 0
         fi
 
-        # --- 2) Download the Code Dx / SRM CLI tarball (pinned) ---
-        URL="https://github.com/codedx/codedx-cli-client/releases/download/v0.3.0/codedx-client-v0.3.0-linux-x86_64.tar.bz2"
-        echo "Downloading SRM CLI from: $URL"
-        curl -fL "$URL" -o codedx-cli.tar.bz2
+        # 2) Compose the SRM API upload URL
+        SRM_PROJECT_ID="$(SRM_PROJECT_ID)"
+        SRM_BRANCH_ID="$(SRM_BRANCH_ID)"    # Add to variable group!
+        SRM_BASE_URL="$(SRM_BASE_URL)"
+        SRM_API_KEY="$(SRM_API_KEY)"
+        SRM_UPLOAD_URL="${SRM_BASE_URL%/}/api/projects/${SRM_PROJECT_ID};branchId=${SRM_BRANCH_ID}/analysis"
 
-        # --- 3) Extract (install bzip2 if needed on this self-hosted agent) ---
-        mkdir -p cli
-        if ! tar -xjf codedx-cli.tar.bz2 -C cli 2>/dev/null; then
-          echo "tar -xjf failed; attempting to install bzip2 (requires sudo)..."
-          sudo apt-get update -y && sudo apt-get install -y bzip2
-          tar -xjf codedx-cli.tar.bz2 -C cli
-        fi
+        echo "Uploading coverity.json to SRM at $SRM_UPLOAD_URL"
 
-        # Find the CLI binary inside the extracted folder
-        CLI="$(find cli -type f -name 'codedx-client*' | head -n1)"
-        if [ -z "$CLI" ]; then
-          echo "codedx-client executable not found after extraction."
+        # 3) Upload using curl
+        http_code=$(curl -k -s -o srm-result.json -w "HTTP_CODE=%{http_code}" \
+          -X POST "$SRM_UPLOAD_URL" \
+          -H "API-Key: $SRM_API_KEY" \
+          -F "file=@coverity.json")
+
+        echo "SRM HTTP CODE: $http_code"
+        preview=$(head -c 300 srm-result.json)
+        echo "SRM RAW RESPONSE (first 300 chars): $preview"
+
+        if [[ "$http_code" != *"HTTP_CODE=200"* && "$http_code" != *"HTTP_CODE=202"* ]]; then
+          echo "SRM upload failed. Body (truncated): $preview"
           exit 1
         fi
-        chmod +x "$CLI"
 
-        # --- 4) Normalize SRM base URL (auto-append /codedx if needed) ---
-        BASE="$(SRM_BASE_URL)"
-        try_projects () { "$CLI" "$1" --api-key "api-key:$(SRM_API_KEY)" --insecure projects >/dev/null 2>&1; }
-
-        if ! try_projects "$BASE"; then
-          ALT="${BASE%/}/codedx"
-          echo "SRM base '$BASE' did not respond; retrying with '$ALT'..."
-          if try_projects "$ALT"; then
-            BASE="$ALT"
-          else
-            echo "Unable to reach SRM at '$BASE' or '$ALT'. Check SRM_BASE_URL and cert."
-            exit 1
-          fi
-        fi
-
-        # --- 5) Upload Coverity results ---
-        echo "Uploading to SRM project $(SRM_PROJECT_ID) at $BASE: coverity.json"
-        "$CLI" "$BASE" \
-          --api-key "api-key:$(SRM_API_KEY)" \
-          --insecure \
-          analyze "$(SRM_PROJECT_ID)" coverity.json
+        # (Optional) check for jobId/analysisId in the response if you want
       displayName: Upload results to SRM
