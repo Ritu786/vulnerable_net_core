@@ -87,7 +87,6 @@ stages:
 
         # Export files SRM can ingest
         cov-format-errors --dir cov-int --json-output-v10 coverity.json
-        cov-format-errors --dir cov-int --sarif-output coverity.sarif
 
         cov-commit-defects --dir cov-int `
           --url "$(COVERITY_URL)" `
