@@ -138,18 +138,18 @@ stages:
           --detect.timeout=1200
       displayName: Black Duck Detect (SCA)
   
-# 4) SRM ingest (runtime CLI download)
+# 4) SRM ingest (robust CLI download)
 - stage: SRM
   displayName: Software Risk Manager ingest
   dependsOn:
     - Coverity
     - BlackDuck
   variables:
-  - group: srm-secrets     
+  - group: srm-secrets    # SRM_BASE_URL, SRM_API_KEY, SRM_PROJECT_ID
   jobs:
   - job: srm_push
     displayName: Push findings to SRM
-    pool: { name: blackduck-linux }   # your Linux agent (ss-bd-sca01)
+    pool: { name: blackduck-linux }
     steps:
     - checkout: none
 
@@ -165,28 +165,41 @@ stages:
         set -euo pipefail
         cd "$(Pipeline.Workspace)/srm-inputs"
 
-        # --- Get Code Dx / SRM CLI (Linux x64) ---
-        CLI_VERSION="v0.3.0"
-        CLI_URL="https://github.com/codedx/codedx-cli-client/releases/download/${CLI_VERSION}/codedx-client-linux-amd64"
-        echo "Downloading SRM CLI from: $CLI_URL"
-        curl -fL "$CLI_URL" -o codedx-client
-        chmod +x codedx-client
-        CLI_PATH="./codedx-client"
-
-        # Optional: quick auth check (lists projects; ignore failure)
-        $CLI_PATH "$(SRM_BASE_URL)" --api-key "api-key:$(SRM_API_KEY)" --insecure projects >/dev/null 2>&1 || true
-
-        # Collect files exported by the Coverity stage
+        # 1) Ensure we have an input for SRM
         FILES=""
-        [ -f coverity.json ]  && FILES="$FILES coverity.json"
-
+        [ -f coverity.json ] && FILES="$FILES coverity.json"
         if [ -z "$FILES" ]; then
-          echo "No SRM input files found; skipping upload."
+          echo "No SRM input files (coverity.json) found; nothing to upload."
           exit 0
         fi
 
+        # 2) Find the correct Code Dx CLI asset (Linux) from GitHub
+        TAG_API="https://api.github.com/repos/codedx/codedx-cli-client/releases/tags/v0.3.0"
+        LATEST_API="https://api.github.com/repos/codedx/codedx-cli-client/releases/latest"
+
+        find_url () {
+          curl -fsSL "$1" | grep -Eo 'https://[^"]*codedx[^"]*linux[^"]*amd64[^"]*' | head -n1 || true
+        }
+
+        URL="$(find_url "$TAG_API")"
+        [ -z "$URL" ] && URL="$(find_url "$LATEST_API")"
+
+        if [ -z "$URL" ]; then
+          echo "Could not locate a Linux CLI asset on GitHub Releases."
+          exit 1
+        fi
+
+        echo "Downloading SRM CLI from: $URL"
+        curl -fL "$URL" -o codedx-cli
+        chmod +x codedx-cli
+
+        # 3) TLS trust (demo/self-signed friendly)
+        export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+        # 4) Push results to SRM
         echo "Uploading to SRM project $(SRM_PROJECT_ID): $FILES"
-        $CLI_PATH "$(SRM_BASE_URL)" \
-          --api-key "api-key:$(SRM_API_KEY)" --insecure \
+        ./codedx-cli "$(SRM_BASE_URL)" \
+          --api-key "api-key:$(SRM_API_KEY)" \
+          --insecure \
           analyze "$(SRM_PROJECT_ID)" $FILES
       displayName: Upload results to SRM
